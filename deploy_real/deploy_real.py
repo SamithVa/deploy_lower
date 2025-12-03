@@ -268,207 +268,324 @@ class Controller:
             time.sleep(self.config.control_dt)
 
     def move_to_default_pos(self):
+        """
+        Smoothly move the robot from current pose to the default standing pose.
+        
+        Uses an S-curve trajectory for smooth acceleration/deceleration over 2 seconds.
+        Each step is rate-limited to prevent sudden jumps. This method is called
+        after zero_torque_state to safely bring the robot to its initial standing
+        configuration.
+        
+        Motion parameters:
+            - Total transition time: 2.0 seconds
+            - Maximum step per control cycle: 0.05 rad
+            - Uses softened PD gains (60% kp, 150% kd) for smooth motion
+        """
         print("Moving to default pos.")
-        # move time 2s
-        total_time = 2.0
-        max_step=0.05
-        # 组合索引 & 目标
+        
+        # ==================== Motion Parameters ====================
+        total_time = 2.0    # Duration of the transition (seconds)
+        max_step = 0.05     # Maximum angular change per step (rad)
+        
+        # ==================== Joint Index and Target Setup ====================
+        # Combine leg and arm/waist joint indices for unified control
         dof_idx = self.config.leg_joint2motor_idx + self.config.arm_waist_joint2motor_idx
-        # flip_mask2policy = [1, 1, -1, 1, 1, -1, 1, -1, -1, -1]
-        # self.config.default_angles *=  np.array(flip_mask2policy, dtype=np.float32)
-        target  = np.concatenate([self.config.default_angles, self.config.arm_waist_target]).astype(np.float32)
+        
+        # Concatenate target angles: legs first, then arms/waist
+        target = np.concatenate([self.config.default_angles, self.config.arm_waist_target]).astype(np.float32)
 
-        # 从当前 q 开始
+        # ==================== Initial State ====================
+        # Read current joint positions as starting point
         q_now = np.array([self.low_state.motor_state[idx].q for idx in dof_idx], dtype=np.float32)
         steps = max(1, int(total_time / self.config.control_dt))
 
         # 准备模式过渡增益：比正式站立再软一点
         kps = (self.config.kps + self.config.arm_waist_kps)
         kds = (self.config.kds + self.config.arm_waist_kds)
-        kp_move = np.array(kps, dtype=np.float32) * 0.6
-        kd_move = np.array(kds, dtype=np.float32) * 1.5
+        kp_move = np.array(kps, dtype=np.float32) * 0.6   # 60% position gain
+        kd_move = np.array(kds, dtype=np.float32) * 1.5   # 150% damping gain
 
+        # ==================== S-Curve Trajectory Execution ====================
         for i in range(steps):
             # S-curve 时间系数（0→1）
             t = i / steps
-            s = 3*t**2 - 2*t**3
+            s = 3*t**2 - 2*t**3  # Cubic smoothstep function
 
+            # Compute desired position along trajectory
             q_des_raw = q_now + (target - q_now) * s
 
-            # 每周期限幅，避免猛跳
+            # ==================== Rate Limiting ====================
+            # Clamp each step to max_step to prevent sudden jumps
             if i == 0:
                 last = q_now.copy()
             delta = np.clip(q_des_raw - last, -max_step, max_step)
             q_des = last + delta
-            last  = q_des
+            last = q_des
 
-            # 下发指令（注意索引对应）
+            # ==================== Send Commands with Joint Limits ====================
             for j, idx in enumerate(dof_idx):
-                # 添加关节限位保护
-                if j < len(self.config.leg_joint2motor_idx):  # 腿部关节
+                # Apply joint position limits for safety
+                if j < len(self.config.leg_joint2motor_idx):
+                    # Leg joints
                     q_clipped = np.clip(q_des[j],
                                     self.config.joint_limits['leg']['q_min'][j],
                                     self.config.joint_limits['leg']['q_max'][j])
-                else:  # 臂部/腰部关节
+                else:
+                    # Arm/waist joints
                     arm_idx = j - len(self.config.leg_joint2motor_idx)
                     q_clipped = np.clip(q_des[j],
                                     self.config.joint_limits['arm_waist']['q_min'][arm_idx],
                                     self.config.joint_limits['arm_waist']['q_max'][arm_idx])
                 
-                self.low_cmd.motor_cmd[idx].q  = float(q_clipped)
-                self.low_cmd.motor_cmd[idx].qd = 0.0
-                self.low_cmd.motor_cmd[idx].kp = float(kp_move[j])
-                self.low_cmd.motor_cmd[idx].kd = float(kd_move[j])
-                self.low_cmd.motor_cmd[idx].tau= 0.0
+                # Set motor command
+                self.low_cmd.motor_cmd[idx].q = float(q_clipped)    # Target position
+                self.low_cmd.motor_cmd[idx].qd = 0.0                # Zero target velocity
+                self.low_cmd.motor_cmd[idx].kp = float(kp_move[j])  # Position gain
+                self.low_cmd.motor_cmd[idx].kd = float(kd_move[j])  # Damping gain
+                self.low_cmd.motor_cmd[idx].tau = 0.0               # No feedforward torque
 
             self.send_cmd(self.low_cmd)
-            # 用“定时器式 sleep”保证周期稳定
+            
+            # ==================== Precise Timing ====================
+            # Timer-style sleep for consistent control frequency
             self._next_t = getattr(self, "_next_t", time.perf_counter())
             self._next_t += self.config.control_dt
             delay = self._next_t - time.perf_counter()
             time.sleep(delay if delay > 0 else 0)
 
     def default_pos_state(self):
+        """
+        Hold the robot at the default standing position.
+        
+        Continuously sends commands to maintain the default pose with full PD gains.
+        Waits for the A button on the remote controller to be pressed before
+        proceeding to the walking state. This allows the operator to verify
+        the robot is stable before starting locomotion.
+        """
         print("Enter default pos state.")
         print("Waiting for the Button A signal...")
+        
         while self.remote_controller.button[KeyMap.A] != 1:
+            # ==================== Leg Joint Commands ====================
             for i in range(len(self.config.leg_joint2motor_idx)):
                 motor_idx = self.config.leg_joint2motor_idx[i]
-                # 添加腿部关节限位
+                # Apply joint limits for safety
                 q_clipped = np.clip(self.config.default_angles[i],
                                 self.config.joint_limits['leg']['q_min'][i],
                                 self.config.joint_limits['leg']['q_max'][i])
-                self.low_cmd.motor_cmd[motor_idx].q = q_clipped 
-                self.low_cmd.motor_cmd[motor_idx].qd = 0
-                self.low_cmd.motor_cmd[motor_idx].kp = self.config.kps[i]
-                self.low_cmd.motor_cmd[motor_idx].kd = self.config.kds[i]
-                self.low_cmd.motor_cmd[motor_idx].tau = 0
+                self.low_cmd.motor_cmd[motor_idx].q = q_clipped     # Target position
+                self.low_cmd.motor_cmd[motor_idx].qd = 0            # Zero velocity
+                self.low_cmd.motor_cmd[motor_idx].kp = self.config.kps[i]  # Full stiffness
+                self.low_cmd.motor_cmd[motor_idx].kd = self.config.kds[i]  # Full damping
+                self.low_cmd.motor_cmd[motor_idx].tau = 0           # No feedforward
+            
+            # ==================== Arm/Waist Joint Commands ====================
             for i in range(len(self.config.arm_waist_joint2motor_idx)):
                 motor_idx = self.config.arm_waist_joint2motor_idx[i]
-                # 添加臂部/腰部关节限位
+                # Apply joint limits for safety
                 q_clipped = np.clip(self.config.arm_waist_target[i],
                                 self.config.joint_limits['arm_waist']['q_min'][i],
                                 self.config.joint_limits['arm_waist']['q_max'][i])
-                self.low_cmd.motor_cmd[motor_idx].q = q_clipped
-                self.low_cmd.motor_cmd[motor_idx].qd = 0
+                self.low_cmd.motor_cmd[motor_idx].q = q_clipped     # Target position
+                self.low_cmd.motor_cmd[motor_idx].qd = 0            # Zero velocity
                 self.low_cmd.motor_cmd[motor_idx].kp = self.config.arm_waist_kps[i]
                 self.low_cmd.motor_cmd[motor_idx].kd = self.config.arm_waist_kds[i]
-                self.low_cmd.motor_cmd[motor_idx].tau = 0
+                self.low_cmd.motor_cmd[motor_idx].tau = 0           # No feedforward
+            
             self.send_cmd(self.low_cmd)
             time.sleep(self.config.control_dt)
 
-    def run(self):
-        self.count_lowlevel += 1
-        # 获取所有关节的位置和速度
-        for i in range(len(self.config.leg_joint2motor_idx)):
-            self.qj[i] = self.low_state.motor_state[self.config.leg_joint2motor_idx[i]].q
-            self.dqj[i] = self.low_state.motor_state[self.config.leg_joint2motor_idx[i]].dq
-            # if self.qj[i] < self.config.joint_limits['leg']['q_min'][i] or self.qj[i] > self.config.joint_limits['leg']['q_max'][i]:
-            #     print(f"Motor {motor_idx}超出限位！当前角度：{self.qj[i]:.2f} rad")
-            #     # 触发保护措施
-            #     controller.move_to_default_pos()
-            #     controller.default_pos_state()
+    # ==========================================================================
+    # MAIN CONTROL LOOP
+    # ==========================================================================
 
+    def run(self):
+        """
+        Execute one step of the locomotion control loop.
+        
+        This method is called repeatedly during walking. It:
+            1. Reads current joint states from the robot
+            2. Constructs the observation vector for the policy
+            3. Runs the neural network policy to get actions
+            4. Converts actions to motor commands and sends them
+        
+        The observation vector includes:
+            - Gait phase (sin/cos of clock)
+            - Velocity commands from remote controller
+            - Joint positions relative to default pose
+            - Joint velocities (scaled)
+            - Previous actions
+            - IMU angular velocity
+            - Body orientation (Euler angles)
+        """
+        self.count_lowlevel += 1
+        
+        # ==================== Read Joint States ====================
+        # Get current joint positions and velocities from motor encoders
+        for i in range(len(self.config.leg_joint2motor_idx)):
+            self.qj[i] = self.low_state.motor_state[self.config.leg_joint2motor_idx[i]].q    # Position (rad)
+            self.dqj[i] = self.low_state.motor_state[self.config.leg_joint2motor_idx[i]].dq  # Velocity (rad/s)
+
+        # ==================== Process IMU Data ====================
         self.obs = np.zeros([1, config.num_obs], dtype=np.float32)
-        # imu_state quaternion: w, x, y, z
+        
+        # Get orientation from IMU quaternion and convert to Euler angles
         quat = self.low_state.imu_state.quaternion
         eu_ang = quaternion_to_euler_array(quat)
-        eu_ang[eu_ang > math.pi] -= 2 * math.pi
-        # quat = R.from_euler('xyz', rpy).as_quat()  # 新增：将欧拉角转换为四元数[x,y,z,w]
-        # quat = np.array([quat[3], quat[0], quat[1], quat[2]])  # 调整顺序为[w,x,y,z]
+        eu_ang[eu_ang > math.pi] -= 2 * math.pi  # Normalize to [-pi, pi]
+        
+        # Get angular velocity from gyroscope
         omega = np.array([self.low_state.imu_state.gyroscope], dtype=np.float32)
+        
+        # ==================== Prepare Joint Observations ====================
+        # Flip mask accounts for mirrored joint conventions between sim and real
         flip_mask2policy = [1, 1, -1, 1, 1, -1, 1, -1, -1, -1]
         qj_obs = self.qj.copy()
         dqj_obs = self.dqj.copy() * np.array(flip_mask2policy, dtype=np.float32)
-        # create observation
-        self.obs[0, 0] = math.sin(2 * math.pi * self.count_lowlevel * self.config.control_dt  / 0.64)
-        self.obs[0, 1] = math.cos(2 * math.pi * self.count_lowlevel * self.config.control_dt  / 0.64)
-        self.obs[0, 2] = self.remote_controller.lx
-        self.obs[0, 3] = self.remote_controller.ly
-        self.obs[0, 4] = self.remote_controller.rx
-        self.obs[0, 5:15] = (qj_obs -self.default_angle) * np.array(flip_mask2policy, dtype=np.float32)
+        
+        # ==================== Build Observation Vector ====================
+        # Gait phase clock (period = 0.64s) - provides timing for gait cycle
+        self.obs[0, 0] = math.sin(2 * math.pi * self.count_lowlevel * self.config.control_dt / 0.64)
+        self.obs[0, 1] = math.cos(2 * math.pi * self.count_lowlevel * self.config.control_dt / 0.64)
+        
+        # Velocity commands from remote controller (normalized)
+        self.obs[0, 2] = self.remote_controller.lx  # Forward/backward
+        self.obs[0, 3] = self.remote_controller.ly  # Left/right strafe
+        self.obs[0, 4] = self.remote_controller.rx  # Turn rate
+        
+        # Joint positions relative to default pose (with flip correction)
+        self.obs[0, 5:15] = (qj_obs - self.default_angle) * np.array(flip_mask2policy, dtype=np.float32)
+        
+        # Scaled joint velocities
         self.obs[0, 15:25] = dqj_obs * 0.05
+        
+        # Previous action (for temporal consistency)
         self.obs[0, 25:35] = self.action
+        
+        # IMU data: angular velocity and orientation
         self.obs[0, 35:38] = omega
         self.obs[0, 38:41] = eu_ang
         
+        # Clip observations to prevent extreme values
         self.obs = np.clip(self.obs, -18, 18)
 
+        # ==================== Update Observation History ====================
+        # Frame stacking: maintain history of observations for temporal context
         self.hist_obs.append(self.obs)
         self.hist_obs.popleft()
 
+        # ==================== Run Policy Network ====================
+        # Concatenate observation history into single input tensor
         self.policy_input = np.zeros([1, self.config.num_obs * self.config.frame_stack], dtype=np.float32)
         for i in range(self.config.frame_stack):
             self.policy_input[0, i * self.config.num_obs : (i + 1) * self.config.num_obs] = self.hist_obs[i][0, :]
+        
+        # Forward pass through the policy network
         self.action[:] = self.policy(torch.tensor(self.policy_input))[0].detach().numpy()
-        self.action = np.clip(self.action, -18, 18)
+        self.action = np.clip(self.action, -18, 18)  # Clip to valid action range
 
+        # ==================== Convert Actions to Joint Targets ====================
+        # Scale actions and add to default pose (with flip correction)
         self.target_q = self.action * self.config.action_scale
         self.target_q = self.target_q * np.array(flip_mask2policy, dtype=np.float32) + self.default_angle
-        # print(self.target_q)
-        # Build low cmd
+        
+        # ==================== Build Leg Motor Commands ====================
         for i in range(len(self.config.leg_joint2motor_idx)):
             motor_idx = self.config.leg_joint2motor_idx[i]
+            # Apply joint limits for safety
             clipped_q = np.clip(self.target_q[i], 
                       self.config.joint_limits['leg']['q_min'][i],
                       self.config.joint_limits['leg']['q_max'][i])
-            self.low_cmd.motor_cmd[motor_idx].q = clipped_q
-            # self.low_cmd.motor_cmd[motor_idx].q = target_dof_pos[i]
-            self.low_cmd.motor_cmd[motor_idx].qd = 0
-            self.low_cmd.motor_cmd[motor_idx].kp = self.config.kps[i]
-            self.low_cmd.motor_cmd[motor_idx].kd = self.config.kds[i]
-            self.low_cmd.motor_cmd[motor_idx].tau = 0
+            self.low_cmd.motor_cmd[motor_idx].q = clipped_q        # Target position
+            self.low_cmd.motor_cmd[motor_idx].qd = 0               # Zero velocity target
+            self.low_cmd.motor_cmd[motor_idx].kp = self.config.kps[i]  # Position gain
+            self.low_cmd.motor_cmd[motor_idx].kd = self.config.kds[i]  # Damping gain
+            self.low_cmd.motor_cmd[motor_idx].tau = 0              # No feedforward torque
 
+        # ==================== Build Arm/Waist Motor Commands ====================
+        # Arms and waist are kept at neutral position during locomotion
         for i in range(len(self.config.arm_waist_joint2motor_idx)):
             motor_idx = self.config.arm_waist_joint2motor_idx[i]
-            self.low_cmd.motor_cmd[motor_idx].q = 0
-            self.low_cmd.motor_cmd[motor_idx].qd = 0
+            self.low_cmd.motor_cmd[motor_idx].q = 0                # Neutral position
+            self.low_cmd.motor_cmd[motor_idx].qd = 0               # Zero velocity
             self.low_cmd.motor_cmd[motor_idx].kp = self.config.arm_waist_kps[i]
             self.low_cmd.motor_cmd[motor_idx].kd = self.config.arm_waist_kds[i]
             self.low_cmd.motor_cmd[motor_idx].tau = 0
 
-        # send the command
+        # ==================== Send Command to Robot ====================
         self.send_cmd(self.low_cmd)
 
+        # Wait for next control cycle
         time.sleep(self.config.control_dt)
 
 
+# ==============================================================================
+# MAIN ENTRY POINT
+# ==============================================================================
+
 if __name__ == "__main__":
+    """
+    Main entry point for the robot deployment script.
+    
+    Usage:
+        python deploy_real.py <network_interface> <config_file>
+        
+    Example:
+        python deploy_real.py eth0 g1.yaml
+        
+    State machine sequence:
+        1. Zero torque state - Robot is passive, wait for START button
+        2. Move to default pose - Smooth transition to standing position
+        3. Default pose hold - Wait for A button to start walking
+        4. Walking loop - Policy controls locomotion, SELECT to exit
+        5. Return to default pose - Safe shutdown sequence
+    """
     import argparse
 
+    # ==================== Parse Command Line Arguments ====================
     parser = argparse.ArgumentParser()
-    parser.add_argument("net", type=str, help="network interface")
+    parser.add_argument("net", type=str, help="network interface (e.g., eth0, enp2s0)")
     parser.add_argument("config", type=str, help="config file name in the configs folder", default="g1.yaml")
     args = parser.parse_args()
 
-    # Load config
+    # ==================== Load Configuration ====================
     config_path = f"/home/jetson/sdk2_python_DM/example/deploy_lower/deploy_real/configs/{args.config}"
     config = Config(config_path)
 
-    # Initialize DDS communication
+    # ==================== Initialize DDS Communication ====================
+    # Domain ID 99 is used for robot communication
     ChannelFactoryInitialize(99, args.net)
 
+    # ==================== Create Controller ====================
     controller = Controller(config)
 
-    # Enter the zero torque state, press the start key to continue executing
+    # ==================== State Machine Execution ====================
+    
+    # STATE 1: Zero torque - Robot is passive, safe for manual positioning
+    # Press START button on remote to proceed
     controller.zero_torque_state()
 
-    # Move to the default position
+    # STATE 2: Move to default standing position
+    # Uses smooth S-curve trajectory over 2 seconds
     controller.move_to_default_pos()
 
-    # Enter the default position state, press the A key to continue executing
+    # STATE 3: Hold default position
+    # Press A button on remote to start walking
     controller.default_pos_state()
 
+    # STATE 4: Main walking loop
+    # Policy controls locomotion based on joystick commands
     while True:
         try:
             controller.run()
-            # Press the select key to exit
+            # Press SELECT button to safely exit walking mode
             print("Press the select key to exit")
             if controller.remote_controller.button[KeyMap.select] == 1:
                 break
         except KeyboardInterrupt:
+            # Also handle Ctrl+C for emergency stop
             break
-    # Enter the damping state
+    
+    # STATE 5: Safe shutdown - Return to default position
     controller.move_to_default_pos()
     controller.default_pos_state()
-    # print("Exit")
