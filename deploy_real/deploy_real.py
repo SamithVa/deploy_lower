@@ -481,7 +481,7 @@ class Controller:
             self.policy_input[0, i * self.config.num_obs : (i + 1) * self.config.num_obs] = self.hist_obs[i][0, :]
         
         # Forward pass through the policy network
-        self.action[:] = self.policy(torch.tensor(self.policy_input))[0].detach().numpy()
+        self.action[:] = self.policy(torch.tensor(self.policy_input))[0].detach().numpy() # NOTE
         self.action = np.clip(self.action, -18, 18)  # Clip to valid action range
 
         # ==================== Convert Actions to Joint Targets ====================
