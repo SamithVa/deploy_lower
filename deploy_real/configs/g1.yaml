@@ -1,0 +1,34 @@
+# 
+control_dt: 0.01
+
+msg_type: "hg"     # "hg" or "go"
+imu_type: "pelvis"    # "torso" or "pelvis"
+
+lowcmd_topic: "rt/lowcmd"
+lowstate_topic: "rt/lowstate"
+
+policy_path: "/home/jetson/sdk2_python_DM/example/deploy_lower/pre_train/g1/motion.pt"
+
+leg_joint2motor_idx: [4, 3, 2, 1, 0, 9, 8, 7, 6, 5]
+kps: [40, 40, 40, 40, 40, 40, 40, 40, 40, 40]
+kds: [0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3]
+default_angles: [-0.3,  0.0,  0.0,  0.5, -0.2, 0.3, 
+                  0.0,  0.0,  -0.5,  0.2]
+
+arm_waist_joint2motor_idx: [10, 11, 12, 13, 14, 15, 16, 17, 18]
+
+arm_waist_kps: [15, 3, 3, 2, 2, 3, 3, 2, 2]
+
+arm_waist_kds: [1, 0.8, 0.8, 0.1, 0.1, 0.8, 0.8, 0.1, 0.1]
+
+arm_waist_target: [ 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+ang_vel_scale: 0.25
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+action_scale: 0.25
+cmd_scale: [2.0, 2.0, 0.25]
+num_actions: 10
+num_obs: 41
+
+max_cmd: [0.8, 0.5, 1.57]
